@@ -39,7 +39,7 @@ extern "C" {
 
     fn realcugan_destroy_gpu_instance();
 
-    fn realcugan_load(realcugan: *mut c_void, param_path: *const c_char, model_path: *const c_char);
+    fn realcugan_load(realcugan: *mut c_void, param_path: *const c_char, model_path: *const c_char) -> c_int;
 
     fn realcugan_process(
         realcugan: *mut c_void,
@@ -85,16 +85,29 @@ impl RealCugan {
                 2 => 18,
                 3 => 14,
                 4 => 19,
-                _ => panic!()
+                _ => panic!("unsupported scale: {}", scale)
             };
 
             let sync_gap = if model == RealCuganModelType::Nose { 0 } else { sync_gap };
+            let (model, noise) = match (model, scale, noise) {
+                // 4x Pro does not exist in Real-CUGAN, fallback to SE
+                (RealCuganModelType::Pro, 4, n) => {
+                    log::warn!("4x scale is not supported for pro model, falling back to models-se");
+                    (RealCuganModelType::Se, n)
+                }
+                // 3x and 4x only have conservative (-1), no-denoise (0), and denoise3x (3)
+                (m, s, 1 | 2) if s >= 3 => {
+                    log::warn!("denoise level {} is not available for scale {}, falling back to denoise 3x", noise, s);
+                    (m, 3)
+                }
+                (m, _, n) => (m, n),
+            };
+
             let model_dir = match model {
                 RealCuganModelType::Nose => "models-nose",
                 RealCuganModelType::Pro => "models-pro",
                 RealCuganModelType::Se => "models-se"
             };
-
 
             let (model_path, param_path) = if noise == -1 {
                 (format!("{}/{}/up{}x-conservative.bin", models_path, model_dir, scale),
@@ -106,6 +119,15 @@ impl RealCugan {
                 (format!("{}/{}/up{}x-denoise{}x.bin", models_path, model_dir, scale, noise),
                  format!("{}/{}/up{}x-denoise{}x.param", models_path, model_dir, scale, noise))
             };
+
+            if !std::path::Path::new(&param_path).exists() {
+                realcugan_destroy_gpu_instance();
+                panic!("model parameter file not found: {}", param_path);
+            }
+            if !std::path::Path::new(&model_path).exists() {
+                realcugan_destroy_gpu_instance();
+                panic!("model weights file not found: {}", model_path);
+            }
 
             realcugan_init_gpu_instance();
             let gpu_count = realcugan_get_gpu_count() as i32;
@@ -156,7 +178,11 @@ impl RealCugan {
                         calculated_tile_size = 32
                     }
 
-                    calculated_tile_size
+                    if tta_mode {
+                        std::cmp::max(32, calculated_tile_size / 2)
+                    } else {
+                        calculated_tile_size
+                    }
                 }
             } else { tile_size };
             let realcugan = realcugan_init(
@@ -170,10 +196,13 @@ impl RealCugan {
                 sync_gap as i32,
             );
 
-
-            let param_path_cstr = CString::new(param_path).unwrap();
-            let model_path_cstr = CString::new(model_path).unwrap();
-            realcugan_load(realcugan, param_path_cstr.as_ptr(), model_path_cstr.as_ptr());
+            let param_path_cstr = CString::new(param_path.clone()).unwrap();
+            let model_path_cstr = CString::new(model_path.clone()).unwrap();
+            let ret = realcugan_load(realcugan, param_path_cstr.as_ptr(), model_path_cstr.as_ptr());
+            if ret != 0 {
+                realcugan_free(realcugan);
+                panic!("failed to load realcugan model from {} and {}", param_path, model_path);
+            }
 
             Self {
                 realcugan,

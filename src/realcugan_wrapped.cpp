@@ -29,6 +29,7 @@ extern "C" RealCUGAN *realcugan_init(
     realcugan->tilesize = tilesize;
     realcugan->prepadding = prepadding;
     realcugan->syncgap = syncgap;
+    realcugan->bgr_mode = false;
     return realcugan;
 }
 
@@ -80,7 +81,10 @@ extern "C" int realcugan_process_cpu(RealCUGAN *realcugan, const Image *in_image
 }
 
 extern "C" uint32_t realcugan_get_heap_budget(int gpuid) {
-    return ncnn::get_gpu_device(gpuid)->get_heap_budget();
+    if (gpuid < 0) return 0;
+    auto* dev = ncnn::get_gpu_device(gpuid);
+    if (!dev) return 0;
+    return dev->get_heap_budget();
 }
 
 extern "C" void realcugan_free_image(ncnn::Mat *mat_ptr) {
