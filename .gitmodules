@@ -1,3 +1,4 @@
 [submodule "src/realcugan-ncnn-vulkan"]
 	path = src/realcugan-ncnn-vulkan
-	url = https://github.com/nihui/realcugan-ncnn-vulkan
+	url = https://github.com/MEGAMENE/realcugan-ncnn-vulkan.git
+	branch = development
