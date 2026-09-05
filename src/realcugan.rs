@@ -129,7 +129,7 @@ impl RealCugan {
                             calculated_tile_size = 32
                         }
                     } else if scale == 3 {
-                        if heap_budget > 330 {
+                        if heap_budget > 3300 {
                             calculated_tile_size = 400
                         } else if heap_budget > 1900 {
                             calculated_tile_size = 300
