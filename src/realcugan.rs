@@ -5,13 +5,14 @@ use std::fmt;
 use image::{DynamicImage, RgbaImage, RgbImage};
 use libc::{c_char, c_int, c_uchar, c_uint, c_void};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealCuganError {
     ModelNotFound(String),
     InvalidGpuDevice(i32),
     LoadFailed(String, String),
     InvalidDimensions(u32, u32),
     ProcessFailed(i32),
+    UnsupportedScale(u32),
 }
 
 impl fmt::Display for RealCuganError {
@@ -22,6 +23,7 @@ impl fmt::Display for RealCuganError {
             Self::LoadFailed(p, m) => write!(f, "Failed to load Real-CUGAN model from {} and {}", p, m),
             Self::InvalidDimensions(w, h) => write!(f, "Invalid image dimensions: {}x{}", w, h),
             Self::ProcessFailed(code) => write!(f, "Real-CUGAN GPU processing failed with code: {}", code),
+            Self::UnsupportedScale(s) => write!(f, "Unsupported Real-CUGAN scale: {}", s),
         }
     }
 }
@@ -103,61 +105,59 @@ impl RealCugan {
                tta_mode: bool,
                num_threads: i32,
                models_path: String,
-    ) -> Self {
+    ) -> Result<Self, RealCuganError> {
+        let prepadding = match scale {
+            2 => 18,
+            3 => 14,
+            4 => 19,
+            _ => return Err(RealCuganError::UnsupportedScale(scale)),
+        };
+
+        let sync_gap = if model == RealCuganModelType::Nose { 0 } else { sync_gap };
+        let (model, noise) = match (model, scale, noise) {
+            // 4x Pro does not exist in Real-CUGAN, fallback to SE
+            (RealCuganModelType::Pro, 4, n) => {
+                log::warn!("4x scale is not supported for pro model, falling back to models-se");
+                (RealCuganModelType::Se, n)
+            }
+            // 3x and 4x only have conservative (-1), no-denoise (0), and denoise3x (3)
+            (m, s, 1 | 2) if s >= 3 => {
+                log::warn!("denoise level {} is not available for scale {}, falling back to denoise 3x", noise, s);
+                (m, 3)
+            }
+            (m, _, n) => (m, n),
+        };
+
+        let model_dir = match model {
+            RealCuganModelType::Nose => "models-nose",
+            RealCuganModelType::Pro => "models-pro",
+            RealCuganModelType::Se => "models-se"
+        };
+
+        let (model_path, param_path) = if noise == -1 {
+            (format!("{}/{}/up{}x-conservative.bin", models_path, model_dir, scale),
+             format!("{}/{}/up{}x-conservative.param", models_path, model_dir, scale))
+        } else if noise == 0 {
+            (format!("{}/{}/up{}x-no-denoise.bin", models_path, model_dir, scale),
+             format!("{}/{}/up{}x-no-denoise.param", models_path, model_dir, scale))
+        } else {
+            (format!("{}/{}/up{}x-denoise{}x.bin", models_path, model_dir, scale, noise),
+             format!("{}/{}/up{}x-denoise{}x.param", models_path, model_dir, scale, noise))
+        };
+
+        if !std::path::Path::new(&param_path).exists() {
+            return Err(RealCuganError::ModelNotFound(param_path));
+        }
+        if !std::path::Path::new(&model_path).exists() {
+            return Err(RealCuganError::ModelNotFound(model_path));
+        }
+
         unsafe {
-            let prepadding = match scale {
-                2 => 18,
-                3 => 14,
-                4 => 19,
-                _ => panic!("unsupported scale: {}", scale)
-            };
-
-            let sync_gap = if model == RealCuganModelType::Nose { 0 } else { sync_gap };
-            let (model, noise) = match (model, scale, noise) {
-                // 4x Pro does not exist in Real-CUGAN, fallback to SE
-                (RealCuganModelType::Pro, 4, n) => {
-                    log::warn!("4x scale is not supported for pro model, falling back to models-se");
-                    (RealCuganModelType::Se, n)
-                }
-                // 3x and 4x only have conservative (-1), no-denoise (0), and denoise3x (3)
-                (m, s, 1 | 2) if s >= 3 => {
-                    log::warn!("denoise level {} is not available for scale {}, falling back to denoise 3x", noise, s);
-                    (m, 3)
-                }
-                (m, _, n) => (m, n),
-            };
-
-            let model_dir = match model {
-                RealCuganModelType::Nose => "models-nose",
-                RealCuganModelType::Pro => "models-pro",
-                RealCuganModelType::Se => "models-se"
-            };
-
-            let (model_path, param_path) = if noise == -1 {
-                (format!("{}/{}/up{}x-conservative.bin", models_path, model_dir, scale),
-                 format!("{}/{}/up{}x-conservative.param", models_path, model_dir, scale))
-            } else if noise == 0 {
-                (format!("{}/{}/up{}x-no-denoise.bin", models_path, model_dir, scale),
-                 format!("{}/{}/up{}x-no-denoise.param", models_path, model_dir, scale))
-            } else {
-                (format!("{}/{}/up{}x-denoise{}x.bin", models_path, model_dir, scale, noise),
-                 format!("{}/{}/up{}x-denoise{}x.param", models_path, model_dir, scale, noise))
-            };
-
-            if !std::path::Path::new(&param_path).exists() {
-                realcugan_destroy_gpu_instance();
-                panic!("model parameter file not found: {}", param_path);
-            }
-            if !std::path::Path::new(&model_path).exists() {
-                realcugan_destroy_gpu_instance();
-                panic!("model weights file not found: {}", model_path);
-            }
-
             realcugan_init_gpu_instance();
             let gpu_count = realcugan_get_gpu_count() as i32;
             if gpuid < -1 || gpuid >= gpu_count {
                 realcugan_destroy_gpu_instance();
-                panic!("invalid gpu device")
+                return Err(RealCuganError::InvalidGpuDevice(gpuid));
             }
             let tile_size = if tile_size == 0 {
                 if gpuid == -1 { 400 } else {
@@ -232,40 +232,53 @@ impl RealCugan {
                 sync_gap as i32,
             );
 
-            let param_path_cstr = CString::new(param_path.clone()).unwrap();
-            let model_path_cstr = CString::new(model_path.clone()).unwrap();
+            let param_path_cstr = CString::new(param_path.clone())
+                .map_err(|_| RealCuganError::ModelNotFound(param_path.clone()))?;
+            let model_path_cstr = CString::new(model_path.clone())
+                .map_err(|_| RealCuganError::ModelNotFound(model_path.clone()))?;
             let ret = realcugan_load(realcugan, param_path_cstr.as_ptr(), model_path_cstr.as_ptr());
             if ret != 0 {
                 realcugan_free(realcugan);
-                panic!("failed to load realcugan model from {} and {}", param_path, model_path);
+                return Err(RealCuganError::LoadFailed(param_path, model_path));
             }
 
-            Self {
+            Ok(Self {
                 realcugan,
                 scale,
-            }
+            })
         }
     }
 
-    pub fn proc_image(&self, image: DynamicImage) -> Result<DynamicImage, RealCuganError> {
-        let (input_image, channels) = match image.color() {
-            image::ColorType::Rgb8 => (image, 3),
-            image::ColorType::Rgba8 => (image, 4),
-            image::ColorType::L8 => (DynamicImage::from(image.to_rgb8()), 3),
-            image::ColorType::La8 => (DynamicImage::from(image.to_rgba8()), 4),
+    pub fn proc_image(&self, image: &DynamicImage) -> Result<DynamicImage, RealCuganError> {
+        // Zero-copy borrow for standard 8-bit RGB/RGBA images
+        enum PixelData<'a> {
+            Borrowed(&'a [u8]),
+            Owned(Vec<u8>),
+        }
+
+        let (pixel_data, channels) = match image.color() {
+            image::ColorType::Rgb8 => (PixelData::Borrowed(image.as_bytes()), 3),
+            image::ColorType::Rgba8 => (PixelData::Borrowed(image.as_bytes()), 4),
+            image::ColorType::L8 => (PixelData::Owned(image.to_rgb8().into_raw()), 3),
+            image::ColorType::La8 => (PixelData::Owned(image.to_rgba8().into_raw()), 4),
             // 16-bit depth normalization: map [0, 65535] -> [0, 255]
-            image::ColorType::Rgb16 | image::ColorType::L16 => (DynamicImage::from(image.to_rgb8()), 3),
-            image::ColorType::Rgba16 | image::ColorType::La16 => (DynamicImage::from(image.to_rgba8()), 4),
-            _ => (DynamicImage::from(image.to_rgb8()), 3),
+            image::ColorType::Rgb16 | image::ColorType::L16 => (PixelData::Owned(image.to_rgb8().into_raw()), 3),
+            image::ColorType::Rgba16 | image::ColorType::La16 => (PixelData::Owned(image.to_rgba8().into_raw()), 4),
+            _ => (PixelData::Owned(image.to_rgb8().into_raw()), 3),
         };
 
-        let in_w = i32::try_from(input_image.width())
-            .map_err(|_| RealCuganError::InvalidDimensions(input_image.width(), input_image.height()))?;
-        let in_h = i32::try_from(input_image.height())
-            .map_err(|_| RealCuganError::InvalidDimensions(input_image.width(), input_image.height()))?;
+        let raw_slice = match &pixel_data {
+            PixelData::Borrowed(slice) => *slice,
+            PixelData::Owned(vec) => vec.as_slice(),
+        };
+
+        let in_w = i32::try_from(image.width())
+            .map_err(|_| RealCuganError::InvalidDimensions(image.width(), image.height()))?;
+        let in_h = i32::try_from(image.height())
+            .map_err(|_| RealCuganError::InvalidDimensions(image.width(), image.height()))?;
 
         let in_buffer = Image {
-            data: input_image.as_bytes().as_ptr() as *const c_uchar,
+            data: raw_slice.as_ptr() as *const c_uchar,
             w: in_w,
             h: in_h,
             c: i32::from(channels),

@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use cmake::Config;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/realcugan_wrapped.cpp");
+    println!("cargo:rerun-if-changed=src/CMakeLists.txt");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let glslang_dir = env::var("GLSLANG_TARGET_DIR").ok();
     let realcugan_dir = out_dir.join("realcugan");
