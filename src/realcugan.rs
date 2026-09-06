@@ -1,8 +1,32 @@
 use std::convert::TryFrom;
 use std::ffi::CString;
+use std::fmt;
 
-use image::{DynamicImage, GrayAlphaImage, GrayImage, RgbaImage, RgbImage};
+use image::{DynamicImage, RgbaImage, RgbImage};
 use libc::{c_char, c_int, c_uchar, c_uint, c_void};
+
+#[derive(Debug)]
+pub enum RealCuganError {
+    ModelNotFound(String),
+    InvalidGpuDevice(i32),
+    LoadFailed(String, String),
+    InvalidDimensions(u32, u32),
+    ProcessFailed(i32),
+}
+
+impl fmt::Display for RealCuganError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModelNotFound(p) => write!(f, "Real-CUGAN model file not found: {}", p),
+            Self::InvalidGpuDevice(id) => write!(f, "Invalid GPU device id: {}", id),
+            Self::LoadFailed(p, m) => write!(f, "Failed to load Real-CUGAN model from {} and {}", p, m),
+            Self::InvalidDimensions(w, h) => write!(f, "Invalid image dimensions: {}x{}", w, h),
+            Self::ProcessFailed(code) => write!(f, "Real-CUGAN GPU processing failed with code: {}", code),
+        }
+    }
+}
+
+impl std::error::Error for RealCuganError {}
 
 #[derive(Debug)]
 #[derive(Copy, Clone, PartialEq)]
@@ -223,82 +247,73 @@ impl RealCugan {
         }
     }
 
-    pub fn proc_image(&self, image: DynamicImage) -> DynamicImage {
-        let bytes_per_pixel = image.color().bytes_per_pixel();
-
-        let (input_image, channels) = if bytes_per_pixel == 1 {
-            (DynamicImage::from(image.to_rgb8()), 3)
-        } else if bytes_per_pixel == 2 {
-            (DynamicImage::from(image.to_rgba8()), 4)
-        } else {
-            (image, bytes_per_pixel)
+    pub fn proc_image(&self, image: DynamicImage) -> Result<DynamicImage, RealCuganError> {
+        let (input_image, channels) = match image.color() {
+            image::ColorType::Rgb8 => (image, 3),
+            image::ColorType::Rgba8 => (image, 4),
+            image::ColorType::L8 => (DynamicImage::from(image.to_rgb8()), 3),
+            image::ColorType::La8 => (DynamicImage::from(image.to_rgba8()), 4),
+            // 16-bit depth normalization: map [0, 65535] -> [0, 255]
+            image::ColorType::Rgb16 | image::ColorType::L16 => (DynamicImage::from(image.to_rgb8()), 3),
+            image::ColorType::Rgba16 | image::ColorType::La16 => (DynamicImage::from(image.to_rgba8()), 4),
+            _ => (DynamicImage::from(image.to_rgb8()), 3),
         };
+
+        let in_w = i32::try_from(input_image.width())
+            .map_err(|_| RealCuganError::InvalidDimensions(input_image.width(), input_image.height()))?;
+        let in_h = i32::try_from(input_image.height())
+            .map_err(|_| RealCuganError::InvalidDimensions(input_image.width(), input_image.height()))?;
 
         let in_buffer = Image {
             data: input_image.as_bytes().as_ptr() as *const c_uchar,
-            w: i32::try_from(input_image.width()).unwrap(),
-            h: i32::try_from(input_image.height()).unwrap(),
+            w: in_w,
+            h: in_h,
             c: i32::from(channels),
         };
 
+        let out_w = in_w * (self.scale as i32);
+        let out_h = in_h * (self.scale as i32);
+        let length = (out_w as usize)
+            .checked_mul(out_h as usize)
+            .and_then(|wh| wh.checked_mul(channels as usize))
+            .ok_or_else(|| RealCuganError::InvalidDimensions(out_w as u32, out_h as u32))?;
 
-        unsafe {
-            let (out_buffer, mat_ptr) =
-                if self.scale == 1 {
-                    let mut mat = std::ptr::null_mut();
-                    let out_buffer = Image {
-                        data: std::ptr::null_mut(),
-                        w: in_buffer.w,
-                        h: in_buffer.h,
-                        c: in_buffer.c,
-                    };
-                    realcugan_process(
-                        self.realcugan,
-                        &in_buffer as *const Image,
-                        &out_buffer as *const Image,
-                        &mut mat,
-                    );
+        let mut out_bytes: Vec<u8> = vec![0u8; length];
 
-                    (out_buffer, mat)
-                } else {
-                    let mut mat = std::ptr::null_mut();
-                    let mut out_buffer = Image {
-                        data: std::ptr::null_mut(),
-                        w: in_buffer.w * self.scale as i32,
-                        h: in_buffer.h * self.scale as i32,
-                        c: i32::from(channels),
-                    };
+        let out_buffer = Image {
+            data: out_bytes.as_mut_ptr() as *mut c_uchar,
+            w: out_w,
+            h: out_h,
+            c: i32::from(channels),
+        };
 
-                    realcugan_process(
-                        self.realcugan,
-                        &in_buffer as *const Image,
-                        &out_buffer as *const Image,
-                        &mut mat,
-                    );
-                    (out_buffer, mat)
-                };
+        let mut mat_ptr = std::ptr::null_mut();
+        let ret = unsafe {
+            realcugan_process(
+                self.realcugan,
+                &in_buffer as *const Image,
+                &out_buffer as *const Image,
+                &mut mat_ptr,
+            )
+        };
 
-            let length = usize::try_from(out_buffer.h * out_buffer.w * channels as i32).unwrap();
-            let copied_bytes = std::slice::from_raw_parts(out_buffer.data as *const u8, length).to_vec();
-            realcugan_free_image(mat_ptr);
-
-            Self::convert_image(out_buffer.w as u32, out_buffer.h as u32, channels, copied_bytes)
+        if ret != 0 {
+            return Err(RealCuganError::ProcessFailed(ret));
         }
+
+        Self::convert_image(out_w as u32, out_h as u32, channels, out_bytes)
     }
 
-    fn convert_image(width: u32, height: u32, channels: u8, bytes: Vec<u8>) -> DynamicImage {
-        let image = match channels {
-            4 => DynamicImage::from(RgbaImage::from_raw(width, height, bytes).unwrap()),
-
-            3 => DynamicImage::from(RgbImage::from_raw(width, height, bytes).unwrap()),
-
-            2 => DynamicImage::from(GrayAlphaImage::from_raw(width, height, bytes).unwrap()),
-
-            1 => DynamicImage::from(GrayImage::from_raw(width, height, bytes).unwrap()),
-
-            _ => panic!("unexpected channel")
-        };
-        image
+    fn convert_image(width: u32, height: u32, channels: u8, bytes: Vec<u8>) -> Result<DynamicImage, RealCuganError> {
+        match channels {
+            4 => RgbaImage::from_raw(width, height, bytes)
+                .map(DynamicImage::from)
+                .ok_or(RealCuganError::InvalidDimensions(width, height)),
+            3 => RgbImage::from_raw(width, height, bytes)
+                .map(DynamicImage::from)
+                .ok_or(RealCuganError::InvalidDimensions(width, height)),
+            _ => Err(RealCuganError::InvalidDimensions(width, height)),
+        }
     }
 }
 
