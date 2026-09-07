@@ -173,10 +173,8 @@ impl RealCugan {
                             calculated_tile_size = 400
                         } else if heap_budget > 800 {
                             calculated_tile_size = 300
-                        } else if heap_budget > 200 {
-                            calculated_tile_size = 100
                         } else {
-                            calculated_tile_size = 32
+                            calculated_tile_size = 200
                         }
                     } else if scale == 3 {
                         if heap_budget > 9000 {
@@ -187,12 +185,8 @@ impl RealCugan {
                             calculated_tile_size = 400
                         } else if heap_budget > 1900 {
                             calculated_tile_size = 300
-                        } else if heap_budget > 950 {
-                            calculated_tile_size = 200
-                        } else if heap_budget > 320 {
-                            calculated_tile_size = 100
                         } else {
-                            calculated_tile_size = 32
+                            calculated_tile_size = 200
                         }
                     } else if scale == 4 {
                         if heap_budget > 9000 {
@@ -203,19 +197,15 @@ impl RealCugan {
                             calculated_tile_size = 400
                         } else if heap_budget > 980 {
                             calculated_tile_size = 300
-                        } else if heap_budget > 530 {
-                            calculated_tile_size = 200
-                        } else if heap_budget > 240 {
-                            calculated_tile_size = 100
                         } else {
-                            calculated_tile_size = 32
+                            calculated_tile_size = 200
                         }
                     } else {
-                        calculated_tile_size = 32
+                        calculated_tile_size = 200
                     }
 
                     if tta_mode {
-                        std::cmp::max(32, calculated_tile_size / 2)
+                        std::cmp::max(100, calculated_tile_size / 2)
                     } else {
                         calculated_tile_size
                     }
