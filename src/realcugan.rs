@@ -267,6 +267,10 @@ impl RealCugan {
         let in_h = i32::try_from(image.height())
             .map_err(|_| RealCuganError::InvalidDimensions(image.width(), image.height()))?;
 
+        if in_w <= 0 || in_h <= 0 {
+            return Err(RealCuganError::InvalidDimensions(image.width(), image.height()));
+        }
+
         let in_buffer = Image {
             data: raw_slice.as_ptr() as *const c_uchar,
             w: in_w,
