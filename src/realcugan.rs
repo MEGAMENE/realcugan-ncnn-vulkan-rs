@@ -165,11 +165,7 @@ impl RealCugan {
                     let heap_budget = realcugan_get_heap_budget(gpuid);
 
                     if scale == 2 {
-                        if heap_budget > 9000 {
-                            calculated_tile_size = 800
-                        } else if heap_budget > 6000 {
-                            calculated_tile_size = 600
-                        } else if heap_budget > 1300 {
+                        if heap_budget > 1300 {
                             calculated_tile_size = 400
                         } else if heap_budget > 800 {
                             calculated_tile_size = 300
@@ -177,11 +173,7 @@ impl RealCugan {
                             calculated_tile_size = 200
                         }
                     } else if scale == 3 {
-                        if heap_budget > 9000 {
-                            calculated_tile_size = 800
-                        } else if heap_budget > 6000 {
-                            calculated_tile_size = 600
-                        } else if heap_budget > 3300 {
+                        if heap_budget > 3300 {
                             calculated_tile_size = 400
                         } else if heap_budget > 1900 {
                             calculated_tile_size = 300
@@ -189,11 +181,7 @@ impl RealCugan {
                             calculated_tile_size = 200
                         }
                     } else if scale == 4 {
-                        if heap_budget > 9000 {
-                            calculated_tile_size = 800
-                        } else if heap_budget > 6000 {
-                            calculated_tile_size = 600
-                        } else if heap_budget > 1690 {
+                        if heap_budget > 1690 {
                             calculated_tile_size = 400
                         } else if heap_budget > 980 {
                             calculated_tile_size = 300
