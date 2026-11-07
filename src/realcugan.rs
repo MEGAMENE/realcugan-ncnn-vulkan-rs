@@ -30,8 +30,7 @@ impl fmt::Display for RealCuganError {
 
 impl std::error::Error for RealCuganError {}
 
-#[derive(Debug)]
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum RealCuganModelType {
     Nose,
     Pro,
@@ -47,6 +46,7 @@ pub struct Image {
     pub c: c_int,
 }
 
+#[cfg(not(headless_stub))]
 extern "C" {
     fn realcugan_init(
         gpuid: c_int,
@@ -88,6 +88,48 @@ extern "C" {
     fn realcugan_free(realcugan: *mut c_void);
 }
 
+#[cfg(headless_stub)]
+unsafe fn realcugan_init(
+    _gpuid: c_int,
+    _tta_mode: bool,
+    _num_threads: c_int,
+    _noise: c_int,
+    _scale: c_int,
+    _tilesize: c_int,
+    _prepadding: c_int,
+    _sync_gap: c_int,
+) -> *mut c_void {
+    std::ptr::NonNull::<u8>::dangling().as_ptr() as *mut c_void
+}
+#[cfg(headless_stub)]
+unsafe fn realcugan_init_gpu_instance() {}
+#[cfg(headless_stub)]
+unsafe fn realcugan_get_gpu_count() -> c_int { 1 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_destroy_gpu_instance() {}
+#[cfg(headless_stub)]
+unsafe fn realcugan_load(_realcugan: *mut c_void, _param_path: *const c_char, _model_path: *const c_char) -> c_int { 0 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_process(
+    _realcugan: *mut c_void,
+    _in_image: *const Image,
+    _out_image: *const Image,
+    _mat_ptr: *mut *mut c_void,
+) -> c_int { 0 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_process_cpu(
+    _realcugan: *mut c_void,
+    _in_image: &Image,
+    _out_image: &Image,
+    _mat_ptr: *mut *mut c_void,
+) -> c_int { 0 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_get_heap_budget(_gpuid: c_int) -> c_uint { 16384 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_free_image(_mat_ptr: *mut c_void) {}
+#[cfg(headless_stub)]
+unsafe fn realcugan_free(_realcugan: *mut c_void) {}
+
 pub struct RealCugan {
     realcugan: *mut c_void,
     scale: u32,
@@ -96,15 +138,16 @@ pub struct RealCugan {
 unsafe impl Send for RealCugan {}
 
 impl RealCugan {
-    pub fn new(gpuid: i32,
-               noise: i32,
-               scale: u32,
-               model: RealCuganModelType,
-               tile_size: u32,
-               sync_gap: u32,
-               tta_mode: bool,
-               num_threads: i32,
-               models_path: String,
+    pub fn new(
+        gpuid: i32,
+        noise: i32,
+        scale: u32,
+        model: RealCuganModelType,
+        tile_size: u32,
+        sync_gap: u32,
+        tta_mode: bool,
+        num_threads: i32,
+        models_path: String,
     ) -> Result<Self, RealCuganError> {
         let prepadding = match scale {
             2 => 18,
@@ -131,18 +174,24 @@ impl RealCugan {
         let model_dir = match model {
             RealCuganModelType::Nose => "models-nose",
             RealCuganModelType::Pro => "models-pro",
-            RealCuganModelType::Se => "models-se"
+            RealCuganModelType::Se => "models-se",
         };
 
         let (model_path, param_path) = if noise == -1 {
-            (format!("{}/{}/up{}x-conservative.bin", models_path, model_dir, scale),
-             format!("{}/{}/up{}x-conservative.param", models_path, model_dir, scale))
+            (
+                format!("{}/{}/up{}x-conservative.bin", models_path, model_dir, scale),
+                format!("{}/{}/up{}x-conservative.param", models_path, model_dir, scale),
+            )
         } else if noise == 0 {
-            (format!("{}/{}/up{}x-no-denoise.bin", models_path, model_dir, scale),
-             format!("{}/{}/up{}x-no-denoise.param", models_path, model_dir, scale))
+            (
+                format!("{}/{}/up{}x-no-denoise.bin", models_path, model_dir, scale),
+                format!("{}/{}/up{}x-no-denoise.param", models_path, model_dir, scale),
+            )
         } else {
-            (format!("{}/{}/up{}x-denoise{}x.bin", models_path, model_dir, scale, noise),
-             format!("{}/{}/up{}x-denoise{}x.param", models_path, model_dir, scale, noise))
+            (
+                format!("{}/{}/up{}x-denoise{}x.bin", models_path, model_dir, scale, noise),
+                format!("{}/{}/up{}x-denoise{}x.param", models_path, model_dir, scale, noise),
+            )
         };
 
         if !std::path::Path::new(&param_path).exists() {
@@ -152,6 +201,11 @@ impl RealCugan {
             return Err(RealCuganError::ModelNotFound(model_path));
         }
 
+        let param_path_cstr = CString::new(param_path.clone())
+            .map_err(|_| RealCuganError::ModelNotFound(param_path.clone()))?;
+        let model_path_cstr = CString::new(model_path.clone())
+            .map_err(|_| RealCuganError::ModelNotFound(model_path.clone()))?;
+
         unsafe {
             realcugan_init_gpu_instance();
             let gpu_count = realcugan_get_gpu_count() as i32;
@@ -160,7 +214,9 @@ impl RealCugan {
                 return Err(RealCuganError::InvalidGpuDevice(gpuid));
             }
             let tile_size = if tile_size == 0 {
-                if gpuid == -1 { 400 } else {
+                if gpuid == -1 {
+                    400
+                } else {
                     let calculated_tile_size;
                     let heap_budget = realcugan_get_heap_budget(gpuid);
 
@@ -198,7 +254,9 @@ impl RealCugan {
                         calculated_tile_size
                     }
                 }
-            } else { tile_size };
+            } else {
+                tile_size
+            };
             let realcugan = realcugan_init(
                 gpuid,
                 tta_mode,
@@ -209,11 +267,11 @@ impl RealCugan {
                 prepadding,
                 sync_gap as i32,
             );
+            if realcugan.is_null() {
+                realcugan_destroy_gpu_instance();
+                return Err(RealCuganError::LoadFailed(param_path, model_path));
+            }
 
-            let param_path_cstr = CString::new(param_path.clone())
-                .map_err(|_| RealCuganError::ModelNotFound(param_path.clone()))?;
-            let model_path_cstr = CString::new(model_path.clone())
-                .map_err(|_| RealCuganError::ModelNotFound(model_path.clone()))?;
             let ret = realcugan_load(realcugan, param_path_cstr.as_ptr(), model_path_cstr.as_ptr());
             if ret != 0 {
                 realcugan_free(realcugan);
@@ -259,6 +317,15 @@ impl RealCugan {
             return Err(RealCuganError::InvalidDimensions(image.width(), image.height()));
         }
 
+        let expected_in_len = (in_w as usize)
+            .checked_mul(in_h as usize)
+            .and_then(|wh| wh.checked_mul(channels as usize))
+            .ok_or_else(|| RealCuganError::InvalidDimensions(image.width(), image.height()))?;
+
+        if raw_slice.len() != expected_in_len {
+            return Err(RealCuganError::InvalidDimensions(image.width(), image.height()));
+        }
+
         let in_buffer = Image {
             data: raw_slice.as_ptr() as *const c_uchar,
             w: in_w,
@@ -266,8 +333,12 @@ impl RealCugan {
             c: i32::from(channels),
         };
 
-        let out_w = in_w * (self.scale as i32);
-        let out_h = in_h * (self.scale as i32);
+        let out_w = in_w
+            .checked_mul(self.scale as i32)
+            .ok_or_else(|| RealCuganError::InvalidDimensions(image.width(), image.height()))?;
+        let out_h = in_h
+            .checked_mul(self.scale as i32)
+            .ok_or_else(|| RealCuganError::InvalidDimensions(image.width(), image.height()))?;
         let length = (out_w as usize)
             .checked_mul(out_h as usize)
             .and_then(|wh| wh.checked_mul(channels as usize))
