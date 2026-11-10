@@ -139,6 +139,7 @@ unsafe fn realcugan_get_gpu_device_type(_gpuid: c_int) -> c_int { 2 }
 #[cfg(headless_stub)]
 unsafe fn realcugan_calculate_tile_size(_gpuid: c_int, _scale: c_int, _prepadding: c_int) -> c_int { 400 }
 #[cfg(headless_stub)]
+#[allow(dead_code)]
 unsafe fn realcugan_free_image(_mat_ptr: *mut c_void) {}
 #[cfg(headless_stub)]
 unsafe fn realcugan_free(_realcugan: *mut c_void) {}
