@@ -7,6 +7,8 @@
 #include "realcugan.h"
 
 #include <atomic>
+#include <cmath>
+#include <algorithm>
 #include <mutex>
 
 typedef struct Image {
@@ -18,22 +20,27 @@ typedef struct Image {
 
 extern "C" RealCUGAN *realcugan_init(
         int gpuid,
-        bool tta_mode,
+        int tta_level,
         int num_threads,
         int noise,
         int scale,
         int tilesize,
         int prepadding,
-        int syncgap
+        int syncgap,
+        bool use_fp16_arithmetic
 ) {
     try {
-        auto realcugan = new RealCUGAN(gpuid, tta_mode, num_threads);
+        if (tta_level != 1 && tta_level != 2 && tta_level != 4 && tta_level != 8) {
+            tta_level = 1;
+        }
+        auto realcugan = new RealCUGAN(gpuid, tta_level, num_threads);
         realcugan->noise = noise;
         realcugan->scale = scale;
         realcugan->tilesize = tilesize;
         realcugan->prepadding = prepadding;
         realcugan->syncgap = syncgap;
         realcugan->bgr_mode = false;
+        realcugan->use_fp16_arithmetic = use_fp16_arithmetic;
         return realcugan;
     } catch (...) {
         return nullptr;
@@ -53,6 +60,7 @@ extern "C" void realcugan_init_gpu_instance() {
     } catch (...) {
     }
 }
+
 extern "C" int realcugan_get_gpu_count() {
     try {
         return ncnn::get_gpu_count();
@@ -136,6 +144,42 @@ extern "C" uint32_t realcugan_get_heap_budget(int gpuid) {
         return dev->get_heap_budget();
     } catch (...) {
         return 0;
+    }
+}
+
+extern "C" int realcugan_get_gpu_device_type(int gpuid) {
+    try {
+        if (gpuid < 0) return -1;
+        auto* dev = ncnn::get_gpu_device(gpuid);
+        if (!dev) return -1;
+        return dev->info.type();
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C" int realcugan_calculate_tile_size(int gpuid, int scale, int prepadding) {
+    try {
+        if (gpuid < 0) return 400;
+        auto* dev = ncnn::get_gpu_device(gpuid);
+        if (!dev) return 400;
+        uint32_t heap_budget_mb = dev->get_heap_budget();
+        double safe_vram = (double)heap_budget_mb * 1024.0 * 1024.0 * 0.70;
+        double bpp = 7004.0;
+        if (scale == 2) bpp = 7004.0;
+        else if (scale == 3) bpp = 18432.0;
+        else if (scale == 4) bpp = 9011.0;
+
+        int calculated_tile = (int)(std::sqrt(safe_vram / bpp) - 2.0 * prepadding);
+        calculated_tile = (calculated_tile / 32) * 32;
+
+        int max_tile = 1600;
+        if (dev->info.type() == 1) { // integrated GPU
+            max_tile = (scale == 3) ? 256 : 384;
+        }
+        return std::max(32, std::min(calculated_tile, max_tile));
+    } catch (...) {
+        return 400;
     }
 }
 

@@ -2,7 +2,7 @@ use std::convert::TryFrom;
 use std::ffi::CString;
 use std::fmt;
 
-use image::{DynamicImage, RgbaImage, RgbImage};
+use image::{DynamicImage, RgbImage, RgbaImage};
 use libc::{c_char, c_int, c_uchar, c_uint, c_void};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub enum RealCuganError {
     InvalidDimensions(u32, u32),
     ProcessFailed(i32),
     UnsupportedScale(u32),
+    InvalidTtaLevel(u32),
 }
 
 impl fmt::Display for RealCuganError {
@@ -22,15 +23,16 @@ impl fmt::Display for RealCuganError {
             Self::InvalidGpuDevice(id) => write!(f, "Invalid GPU device id: {}", id),
             Self::LoadFailed(p, m) => write!(f, "Failed to load Real-CUGAN model from {} and {}", p, m),
             Self::InvalidDimensions(w, h) => write!(f, "Invalid image dimensions: {}x{}", w, h),
-            Self::ProcessFailed(code) => write!(f, "Real-CUGAN GPU processing failed with code: {}", code),
+            Self::ProcessFailed(code) => write!(f, "Real-CUGAN processing failed with code: {}", code),
             Self::UnsupportedScale(s) => write!(f, "Unsupported Real-CUGAN scale: {}", s),
+            Self::InvalidTtaLevel(lvl) => write!(f, "Invalid TTA level (must be 1, 2, 4, or 8): {}", lvl),
         }
     }
 }
 
 impl std::error::Error for RealCuganError {}
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RealCuganModelType {
     Nose,
     Pro,
@@ -50,13 +52,14 @@ pub struct Image {
 extern "C" {
     fn realcugan_init(
         gpuid: c_int,
-        tta_mode: bool,
+        tta_level: c_int,
         num_threads: c_int,
         noise: c_int,
         scale: c_int,
         tilesize: c_int,
         prepadding: c_int,
         sync_gap: c_int,
+        use_fp16_arithmetic: bool,
     ) -> *mut c_void;
 
     fn realcugan_init_gpu_instance();
@@ -76,13 +79,18 @@ extern "C" {
 
     fn realcugan_process_cpu(
         realcugan: *mut c_void,
-        in_image: &Image,
-        out_image: &Image,
+        in_image: *const Image,
+        out_image: *const Image,
         mat_ptr: *mut *mut c_void,
     ) -> c_int;
 
     fn realcugan_get_heap_budget(gpuid: c_int) -> c_uint;
 
+    fn realcugan_get_gpu_device_type(gpuid: c_int) -> c_int;
+
+    fn realcugan_calculate_tile_size(gpuid: c_int, scale: c_int, prepadding: c_int) -> c_int;
+
+    #[allow(dead_code)]
     fn realcugan_free_image(mat_ptr: *mut c_void);
 
     fn realcugan_free(realcugan: *mut c_void);
@@ -91,13 +99,14 @@ extern "C" {
 #[cfg(headless_stub)]
 unsafe fn realcugan_init(
     _gpuid: c_int,
-    _tta_mode: bool,
+    _tta_level: c_int,
     _num_threads: c_int,
     _noise: c_int,
     _scale: c_int,
     _tilesize: c_int,
     _prepadding: c_int,
     _sync_gap: c_int,
+    _use_fp16_arithmetic: bool,
 ) -> *mut c_void {
     std::ptr::NonNull::<u8>::dangling().as_ptr() as *mut c_void
 }
@@ -119,12 +128,16 @@ unsafe fn realcugan_process(
 #[cfg(headless_stub)]
 unsafe fn realcugan_process_cpu(
     _realcugan: *mut c_void,
-    _in_image: &Image,
-    _out_image: &Image,
+    _in_image: *const Image,
+    _out_image: *const Image,
     _mat_ptr: *mut *mut c_void,
 ) -> c_int { 0 }
 #[cfg(headless_stub)]
 unsafe fn realcugan_get_heap_budget(_gpuid: c_int) -> c_uint { 16384 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_get_gpu_device_type(_gpuid: c_int) -> c_int { 2 }
+#[cfg(headless_stub)]
+unsafe fn realcugan_calculate_tile_size(_gpuid: c_int, _scale: c_int, _prepadding: c_int) -> c_int { 400 }
 #[cfg(headless_stub)]
 unsafe fn realcugan_free_image(_mat_ptr: *mut c_void) {}
 #[cfg(headless_stub)]
@@ -149,6 +162,37 @@ impl RealCugan {
         num_threads: i32,
         models_path: String,
     ) -> Result<Self, RealCuganError> {
+        let tta_level = if tta_mode { 8 } else { 1 };
+        Self::new_with_options(
+            gpuid,
+            noise,
+            scale,
+            model,
+            tile_size,
+            sync_gap,
+            tta_level,
+            false,
+            num_threads,
+            models_path,
+        )
+    }
+
+    pub fn new_with_options(
+        gpuid: i32,
+        noise: i32,
+        scale: u32,
+        model: RealCuganModelType,
+        tile_size: u32,
+        sync_gap: u32,
+        tta_level: u32,
+        use_fp16_arithmetic: bool,
+        num_threads: i32,
+        models_path: String,
+    ) -> Result<Self, RealCuganError> {
+        if tta_level != 1 && tta_level != 2 && tta_level != 4 && tta_level != 8 {
+            return Err(RealCuganError::InvalidTtaLevel(tta_level));
+        }
+
         let prepadding = match scale {
             2 => 18,
             3 => 14,
@@ -213,59 +257,27 @@ impl RealCugan {
                 realcugan_destroy_gpu_instance();
                 return Err(RealCuganError::InvalidGpuDevice(gpuid));
             }
+
             let tile_size = if tile_size == 0 {
                 if gpuid == -1 {
                     400
                 } else {
-                    let calculated_tile_size;
-                    let heap_budget = realcugan_get_heap_budget(gpuid);
-
-                    if scale == 2 {
-                        if heap_budget > 1300 {
-                            calculated_tile_size = 400
-                        } else if heap_budget > 800 {
-                            calculated_tile_size = 300
-                        } else {
-                            calculated_tile_size = 200
-                        }
-                    } else if scale == 3 {
-                        if heap_budget > 3300 {
-                            calculated_tile_size = 400
-                        } else if heap_budget > 1900 {
-                            calculated_tile_size = 300
-                        } else {
-                            calculated_tile_size = 200
-                        }
-                    } else if scale == 4 {
-                        if heap_budget > 1690 {
-                            calculated_tile_size = 400
-                        } else if heap_budget > 980 {
-                            calculated_tile_size = 300
-                        } else {
-                            calculated_tile_size = 200
-                        }
-                    } else {
-                        calculated_tile_size = 200
-                    }
-
-                    if tta_mode {
-                        std::cmp::max(100, calculated_tile_size / 2)
-                    } else {
-                        calculated_tile_size
-                    }
+                    realcugan_calculate_tile_size(gpuid, scale as c_int, prepadding) as u32
                 }
             } else {
                 tile_size
             };
+
             let realcugan = realcugan_init(
                 gpuid,
-                tta_mode,
+                tta_level as c_int,
                 num_threads,
                 noise,
                 scale as i32,
                 tile_size as i32,
                 prepadding,
                 sync_gap as i32,
+                use_fp16_arithmetic,
             );
             if realcugan.is_null() {
                 realcugan_destroy_gpu_instance();
@@ -285,7 +297,55 @@ impl RealCugan {
         }
     }
 
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
+    pub fn get_gpu_count() -> i32 {
+        unsafe {
+            realcugan_init_gpu_instance();
+            let count = realcugan_get_gpu_count();
+            realcugan_destroy_gpu_instance();
+            count
+        }
+    }
+
+    pub fn get_heap_budget(gpuid: i32) -> u32 {
+        unsafe {
+            realcugan_init_gpu_instance();
+            let budget = realcugan_get_heap_budget(gpuid);
+            realcugan_destroy_gpu_instance();
+            budget
+        }
+    }
+
+    pub fn get_gpu_device_type(gpuid: i32) -> i32 {
+        unsafe {
+            realcugan_init_gpu_instance();
+            let dtype = realcugan_get_gpu_device_type(gpuid);
+            realcugan_destroy_gpu_instance();
+            dtype
+        }
+    }
+
+    pub fn calculate_tile_size(gpuid: i32, scale: u32, prepadding: i32) -> u32 {
+        unsafe {
+            realcugan_init_gpu_instance();
+            let size = realcugan_calculate_tile_size(gpuid, scale as c_int, prepadding);
+            realcugan_destroy_gpu_instance();
+            size as u32
+        }
+    }
+
     pub fn proc_image(&self, image: &DynamicImage) -> Result<DynamicImage, RealCuganError> {
+        self.process_internal(image, false)
+    }
+
+    pub fn proc_image_cpu(&self, image: &DynamicImage) -> Result<DynamicImage, RealCuganError> {
+        self.process_internal(image, true)
+    }
+
+    fn process_internal(&self, image: &DynamicImage, force_cpu: bool) -> Result<DynamicImage, RealCuganError> {
         // Zero-copy borrow for standard 8-bit RGB/RGBA images
         enum PixelData<'a> {
             Borrowed(&'a [u8]),
@@ -355,12 +415,21 @@ impl RealCugan {
 
         let mut mat_ptr = std::ptr::null_mut();
         let ret = unsafe {
-            realcugan_process(
-                self.realcugan,
-                &in_buffer as *const Image,
-                &out_buffer as *const Image,
-                &mut mat_ptr,
-            )
+            if force_cpu {
+                realcugan_process_cpu(
+                    self.realcugan,
+                    &in_buffer as *const Image,
+                    &out_buffer as *const Image,
+                    &mut mat_ptr,
+                )
+            } else {
+                realcugan_process(
+                    self.realcugan,
+                    &in_buffer as *const Image,
+                    &out_buffer as *const Image,
+                    &mut mat_ptr,
+                )
+            }
         };
 
         if ret != 0 {
