@@ -216,6 +216,49 @@ fn test_gpu_inference_if_available() {
     assert_eq!(output_pro.width(), 48);
     assert_eq!(output_pro.height(), 48);
 
+    // Test 3x Pro model with TTA level 8 and FP16 arithmetic (Color fidelity regression test)
+    let cugan_pro_3x = RealCugan::new_with_options(
+        0,
+        -1,
+        3,
+        RealCuganModelType::Pro,
+        0,
+        1,
+        8,    // TTA level 8
+        true, // FP16 arithmetic
+        1,
+        models_dir.clone(),
+    ).expect("Failed to initialize 3x Pro model with TTA 8 on GPU");
+
+    let red_img_3x = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, Rgb([240, 30, 30])));
+    let white_img_3x = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, Rgb([255, 255, 255])));
+    let blue_img_3x = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, Rgb([30, 30, 240])));
+    let skin_img_3x = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, Rgb([230, 190, 160])));
+
+    let out_red_3x = cugan_pro_3x.proc_image(&red_img_3x).expect("3x red failed").to_rgb8();
+    let out_white_3x = cugan_pro_3x.proc_image(&white_img_3x).expect("3x white failed").to_rgb8();
+    let out_blue_3x = cugan_pro_3x.proc_image(&blue_img_3x).expect("3x blue failed").to_rgb8();
+    let out_skin_3x = cugan_pro_3x.proc_image(&skin_img_3x).expect("3x skin failed").to_rgb8();
+
+    // Verify color fidelity is preserved (within +/- 2 levels)
+    let red_px = out_red_3x.get_pixel(24, 24);
+    assert!((red_px[0] as i16 - 240).abs() <= 2);
+    assert!((red_px[1] as i16 - 30).abs() <= 2);
+    assert!((red_px[2] as i16 - 30).abs() <= 2);
+
+    let white_px = out_white_3x.get_pixel(24, 24);
+    assert_eq!(white_px, &Rgb([255, 255, 255]));
+
+    let blue_px = out_blue_3x.get_pixel(24, 24);
+    assert!((blue_px[0] as i16 - 30).abs() <= 2);
+    assert!((blue_px[1] as i16 - 30).abs() <= 2);
+    assert!((blue_px[2] as i16 - 240).abs() <= 2);
+
+    let skin_px = out_skin_3x.get_pixel(24, 24);
+    assert!((skin_px[0] as i16 - 230).abs() <= 2);
+    assert!((skin_px[1] as i16 - 190).abs() <= 2);
+    assert!((skin_px[2] as i16 - 160).abs() <= 2);
+
     // Test FP16 arithmetic option
     let cugan_fp16 = RealCugan::new_with_options(
         0,
