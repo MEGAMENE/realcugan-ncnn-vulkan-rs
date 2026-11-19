@@ -1,203 +1,318 @@
-#if _WIN32
-#include <locale>
-#include <codecvt>
-#include <string>
-#endif
-
 #include "realcugan.h"
 
-#include <atomic>
-#include <cmath>
-#include <algorithm>
-#include <mutex>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <new>
 
-typedef struct Image {
-    unsigned char *data;
-    int w;
-    int h;
-    int c;
-} Image;
+namespace {
 
-extern "C" RealCUGAN *realcugan_init(
-        int gpuid,
-        int tta_level,
-        int num_threads,
-        int noise,
-        int scale,
-        int tilesize,
-        int prepadding,
-        int syncgap,
-        bool use_fp16_arithmetic
-) {
-    try {
-        if (tta_level != 1 && tta_level != 2 && tta_level != 4 && tta_level != 8) {
-            tta_level = 1;
-        }
-        auto realcugan = new RealCUGAN(gpuid, tta_level, num_threads);
-        realcugan->noise = noise;
-        realcugan->scale = scale;
-        realcugan->tilesize = tilesize;
-        realcugan->prepadding = prepadding;
-        realcugan->syncgap = syncgap;
-        realcugan->bgr_mode = false;
-        realcugan->use_fp16_arithmetic = use_fp16_arithmetic;
-        return realcugan;
-    } catch (...) {
+constexpr int32_t RC_OK = 0;
+constexpr int32_t RC_ERR_INVALID_ARG = -1;
+constexpr int32_t RC_ERR_GPU_INIT_FAILED = -2;
+constexpr int32_t RC_ERR_INVALID_GPU = -3;
+constexpr int32_t RC_ERR_LOAD_FAILED = -4;
+constexpr int32_t RC_ERR_PROCESS_FAILED = -5;
+constexpr int32_t RC_ERR_OUTPUT_MISMATCH = -6;
+constexpr int32_t RC_ERR_EXCEPTION = -99;
+
+bool ensure_gpu_instance() {
+    // ncnn::create_gpu_instance() is internally mutex-guarded and idempotent.
+    // We intentionally never call ncnn::destroy_gpu_instance(); ncnn registers
+    // atexit(destroy_gpu_instance) and a static holder destructor for orderly
+    // process-exit teardown without breaking concurrent or sibling ncnn users.
+    const int ret = ncnn::create_gpu_instance();
+    return ret == 0 && ncnn::get_gpu_instance() != nullptr;
+}
+
+ncnn::VulkanDevice *get_valid_gpu_device(int32_t gpuid) {
+    if (gpuid < 0) {
         return nullptr;
     }
+    if (!ensure_gpu_instance()) {
+        return nullptr;
+    }
+    if (gpuid >= ncnn::get_gpu_count()) {
+        return nullptr;
+    }
+    ncnn::VulkanDevice *dev = ncnn::get_gpu_device(gpuid);
+    if (!dev || !dev->is_valid()) {
+        return nullptr;
+    }
+    return dev;
 }
 
-static std::atomic<int> s_gpu_instance_refcount{0};
-static std::mutex s_gpu_instance_mutex;
+bool is_valid_scale(int32_t scale) {
+    return scale == 2 || scale == 3 || scale == 4;
+}
 
-extern "C" void realcugan_init_gpu_instance() {
+bool is_valid_tta_level(int32_t tta_level) {
+    return tta_level == 1 || tta_level == 2 || tta_level == 4 || tta_level == 8;
+}
+
+bool is_valid_syncgap(int32_t syncgap) {
+    return syncgap >= 0 && syncgap <= 3;
+}
+
+} // namespace
+
+#if defined(_WIN32)
+using RealCuganPathChar = wchar_t;
+#else
+using RealCuganPathChar = char;
+#endif
+
+struct RealCuganHandle {
+    RealCUGAN engine;
+
+    explicit RealCuganHandle(const RealCUGANConfig &cfg) : engine(cfg) {}
+};
+
+struct RealCuganFfiConfig {
+    int32_t gpuid;
+    int32_t scale;
+    int32_t tilesize;
+    int32_t syncgap;
+    int32_t tta_level;
+    int32_t num_threads;
+    int32_t concurrent_jobs;
+    uint8_t is_pro_model;
+    uint8_t use_fp16_arithmetic;
+};
+
+extern "C" int32_t realcugan_create(
+        const RealCuganFfiConfig *cfg,
+        const RealCuganPathChar *param_path,
+        const RealCuganPathChar *model_path,
+        RealCuganHandle **out_handle
+) {
+    if (out_handle) {
+        *out_handle = nullptr;
+    }
+    if (!cfg || !param_path || !model_path || !out_handle) {
+        return RC_ERR_INVALID_ARG;
+    }
+    if (param_path[0] == static_cast<RealCuganPathChar>(0) ||
+        model_path[0] == static_cast<RealCuganPathChar>(0)) {
+        return RC_ERR_INVALID_ARG;
+    }
+    if (cfg->gpuid < -1 ||
+        !is_valid_scale(cfg->scale) ||
+        (cfg->tilesize != 0 && cfg->tilesize < 32) ||
+        !is_valid_syncgap(cfg->syncgap) ||
+        !is_valid_tta_level(cfg->tta_level) ||
+        cfg->num_threads < 1 ||
+        cfg->concurrent_jobs < 1) {
+        return RC_ERR_INVALID_ARG;
+    }
+
     try {
-        std::lock_guard<std::mutex> lock(s_gpu_instance_mutex);
-        if (s_gpu_instance_refcount == 0) {
-            ncnn::create_gpu_instance();
+        if (cfg->gpuid >= 0) {
+            if (!ensure_gpu_instance()) {
+                return RC_ERR_GPU_INIT_FAILED;
+            }
+            if (cfg->gpuid >= ncnn::get_gpu_count()) {
+                return RC_ERR_INVALID_GPU;
+            }
+            const ncnn::VulkanDevice *dev = ncnn::get_gpu_device(cfg->gpuid);
+            if (!dev || !dev->is_valid()) {
+                return RC_ERR_INVALID_GPU;
+            }
         }
-        s_gpu_instance_refcount++;
+
+        RealCUGANConfig engine_cfg;
+        engine_cfg.gpuid = cfg->gpuid;
+        engine_cfg.scale = cfg->scale;
+        engine_cfg.tilesize = cfg->tilesize;
+        engine_cfg.syncgap = cfg->syncgap;
+        engine_cfg.tta_level = cfg->tta_level;
+        engine_cfg.num_threads = cfg->num_threads;
+        engine_cfg.concurrent_jobs = cfg->concurrent_jobs;
+        engine_cfg.is_pro_model = (cfg->is_pro_model != 0);
+        // Rust `image::DynamicImage` buffers are always RGB/RGBA; override Win32 BGR default.
+        engine_cfg.bgr_mode = false;
+        engine_cfg.use_fp16_arithmetic = (cfg->use_fp16_arithmetic != 0);
+
+        auto *handle = new (std::nothrow) RealCuganHandle(engine_cfg);
+        if (!handle) {
+            return RC_ERR_LOAD_FAILED;
+        }
+
+        const std::filesystem::path param_fs(param_path);
+        const std::filesystem::path model_fs(model_path);
+        if (handle->engine.load(param_fs, model_fs) != 0) {
+            delete handle;
+            return RC_ERR_LOAD_FAILED;
+        }
+
+        *out_handle = handle;
+        return RC_OK;
+    } catch (...) {
+        return RC_ERR_EXCEPTION;
+    }
+}
+
+extern "C" void realcugan_destroy(RealCuganHandle *handle) {
+    try {
+        delete handle;
     } catch (...) {
     }
 }
 
-extern "C" int realcugan_get_gpu_count() {
+extern "C" int32_t realcugan_process(
+        const RealCuganHandle *handle,
+        const uint8_t *in_data,
+        int32_t in_w,
+        int32_t in_h,
+        uint8_t *out_data,
+        int32_t out_w,
+        int32_t out_h,
+        int32_t channels
+) {
+    if (!handle || !in_data || !out_data || in_data == out_data) {
+        return RC_ERR_INVALID_ARG;
+    }
+    if (in_w <= 0 || in_h <= 0 || (channels != 3 && channels != 4)) {
+        return RC_ERR_INVALID_ARG;
+    }
+
     try {
+        const int scale = handle->engine.config().scale;
+        if (!is_valid_scale(scale)) {
+            return RC_ERR_INVALID_ARG;
+        }
+
+        if (in_w > INT_MAX / scale || in_h > INT_MAX / scale) {
+            return RC_ERR_INVALID_ARG;
+        }
+        if (out_w != in_w * scale || out_h != in_h * scale) {
+            return RC_ERR_INVALID_ARG;
+        }
+
+        // Guard signed 32-bit strides/offsets inside Layer 1 and ncnn::Mat::from_pixels_roi / to_pixels
+        if (in_w > INT_MAX / channels || in_h > INT_MAX / (in_w * channels)) {
+            return RC_ERR_INVALID_ARG;
+        }
+        if (out_w > INT_MAX / channels || out_w > INT_MAX / out_h) {
+            return RC_ERR_INVALID_ARG;
+        }
+        if (static_cast<size_t>(out_w) * static_cast<size_t>(channels) >
+            SIZE_MAX / static_cast<size_t>(out_h)) {
+            return RC_ERR_INVALID_ARG;
+        }
+
+        ncnn::Mat in_mat(
+                in_w,
+                in_h,
+                const_cast<uint8_t *>(in_data),
+                static_cast<size_t>(channels),
+                channels
+        );
+        ncnn::Mat out_mat(
+                out_w,
+                out_h,
+                static_cast<void *>(out_data),
+                static_cast<size_t>(channels),
+                channels
+        );
+
+        const int ret = handle->engine.process(in_mat, out_mat);
+        if (ret != 0) {
+            return ret < 0 ? static_cast<int32_t>(ret) : RC_ERR_PROCESS_FAILED;
+        }
+        if (out_mat.data != static_cast<void *>(out_data)) {
+            return RC_ERR_OUTPUT_MISMATCH;
+        }
+        return RC_OK;
+    } catch (...) {
+        return RC_ERR_EXCEPTION;
+    }
+}
+
+extern "C" int32_t realcugan_get_gpu_count(void) {
+    try {
+        if (!ensure_gpu_instance()) {
+            return 0;
+        }
         return ncnn::get_gpu_count();
     } catch (...) {
         return 0;
     }
 }
 
-extern "C" void realcugan_destroy_gpu_instance() {
+extern "C" int32_t realcugan_get_default_gpu_index(void) {
     try {
-        std::lock_guard<std::mutex> lock(s_gpu_instance_mutex);
-        if (s_gpu_instance_refcount > 0) {
-            s_gpu_instance_refcount--;
-            if (s_gpu_instance_refcount == 0) {
-                ncnn::destroy_gpu_instance();
-            }
+        if (!ensure_gpu_instance()) {
+            return -1;
         }
-    } catch (...) {
-    }
-}
-
-extern "C" int realcugan_load(RealCUGAN *realcugan, const char *param_path, const char *model_path) {
-    if (!realcugan || !param_path || !model_path) {
-        return -1;
-    }
-    try {
-#if _WIN32
-        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-        return realcugan->load(converter.from_bytes(param_path), converter.from_bytes(model_path));
-#else
-        return realcugan->load(param_path, model_path);
-#endif
+        return ncnn::get_default_gpu_index();
     } catch (...) {
         return -1;
     }
 }
 
-extern "C" int realcugan_process(RealCUGAN *realcugan, const Image *in_image, Image *out_image, void **mat_ptr) {
-    if (!realcugan || !in_image || !out_image || !in_image->data || !out_image->data) {
-        return -1;
-    }
+extern "C" uint32_t realcugan_get_heap_budget(int32_t gpuid) {
     try {
-        int c = in_image->c;
-        ncnn::Mat in_image_mat(in_image->w, in_image->h, (void *) in_image->data, (size_t) c, c);
-        ncnn::Mat out_image_mat(out_image->w, out_image->h, (void *) out_image->data, (size_t) c, c);
-
-        int result = realcugan->process(in_image_mat, out_image_mat);
-        if (mat_ptr) {
-            *mat_ptr = nullptr;
+        const ncnn::VulkanDevice *dev = get_valid_gpu_device(gpuid);
+        if (!dev) {
+            return 0;
         }
-        return result;
-    } catch (...) {
-        return -1;
-    }
-}
-
-extern "C" int realcugan_process_cpu(RealCUGAN *realcugan, const Image *in_image, Image *out_image, void **mat_ptr) {
-    if (!realcugan || !in_image || !out_image || !in_image->data || !out_image->data) {
-        return -1;
-    }
-    try {
-        int c = in_image->c;
-        ncnn::Mat in_image_mat(in_image->w, in_image->h, (void *) in_image->data, (size_t) c, c);
-        ncnn::Mat out_image_mat(out_image->w, out_image->h, (void *) out_image->data, (size_t) c, c);
-
-        int result = realcugan->process_cpu(in_image_mat, out_image_mat);
-        if (mat_ptr) {
-            *mat_ptr = nullptr;
-        }
-        return result;
-    } catch (...) {
-        return -1;
-    }
-}
-
-extern "C" uint32_t realcugan_get_heap_budget(int gpuid) {
-    try {
-        if (gpuid < 0) return 0;
-        auto* dev = ncnn::get_gpu_device(gpuid);
-        if (!dev) return 0;
         return dev->get_heap_budget();
     } catch (...) {
         return 0;
     }
 }
 
-extern "C" int realcugan_get_gpu_device_type(int gpuid) {
+extern "C" int32_t realcugan_get_gpu_device_type(int32_t gpuid, int32_t *out_type) {
+    if (!out_type) {
+        return RC_ERR_INVALID_ARG;
+    }
     try {
-        if (gpuid < 0) return -1;
-        auto* dev = ncnn::get_gpu_device(gpuid);
-        if (!dev) return -1;
-        return dev->info.type();
+        const ncnn::VulkanDevice *dev = get_valid_gpu_device(gpuid);
+        if (!dev) {
+            return RC_ERR_INVALID_GPU;
+        }
+        *out_type = dev->info.type();
+        return RC_OK;
     } catch (...) {
-        return -1;
+        return RC_ERR_EXCEPTION;
     }
 }
 
-extern "C" int realcugan_calculate_tile_size(int gpuid, int scale, int prepadding) {
+extern "C" int32_t realcugan_should_use_cpu(int32_t gpuid) {
     try {
-        if (gpuid < 0) return 400;
-        auto* dev = ncnn::get_gpu_device(gpuid);
-        if (!dev) return 400;
-        uint32_t heap_budget_mb = dev->get_heap_budget();
-        double safe_vram = (double)heap_budget_mb * 1024.0 * 1024.0 * 0.70;
-        double bpp = 7004.0;
-        if (scale == 2) bpp = 7004.0;
-        else if (scale == 3) bpp = 18432.0;
-        else if (scale == 4) bpp = 9011.0;
-
-        int calculated_tile = (int)(std::sqrt(safe_vram / bpp) - 2.0 * prepadding);
-        calculated_tile = (calculated_tile / 32) * 32;
-
-        int max_tile = 1600;
-        if (dev->info.type() == 1) { // integrated GPU
-            max_tile = (scale == 3) ? 256 : 384;
+        if (gpuid < 0) {
+            return 1;
         }
-        return std::max(32, std::min(calculated_tile, max_tile));
+        const ncnn::VulkanDevice *dev = get_valid_gpu_device(gpuid);
+        return RealCUGAN::should_use_cpu(dev) ? 1 : 0;
     } catch (...) {
-        return 400;
+        return 1;
     }
 }
 
-extern "C" void realcugan_free_image(ncnn::Mat *mat_ptr) {
+extern "C" int32_t realcugan_compute_auto_tilesize(
+        int32_t gpuid,
+        int32_t scale,
+        int32_t tta_level,
+        int32_t concurrent_jobs
+) {
+    if (!is_valid_scale(scale) || !is_valid_tta_level(tta_level) || concurrent_jobs < 1) {
+        return RC_ERR_INVALID_ARG;
+    }
     try {
-        if (mat_ptr) {
-            delete mat_ptr;
-        }
+        const ncnn::VulkanDevice *dev = (gpuid < 0) ? nullptr : get_valid_gpu_device(gpuid);
+        return RealCUGAN::compute_auto_tilesize(dev, scale, tta_level, concurrent_jobs);
     } catch (...) {
+        return RC_ERR_EXCEPTION;
     }
 }
 
-extern "C" void realcugan_free(RealCUGAN *realcugan) {
+extern "C" int32_t realcugan_default_prepadding(int32_t scale) {
     try {
-        if (realcugan) {
-            delete realcugan;
-        }
+        return RealCUGAN::default_prepadding(scale);
     } catch (...) {
+        return 0;
     }
-    realcugan_destroy_gpu_instance();
 }

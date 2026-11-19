@@ -1,114 +1,111 @@
 # realcugan-ncnn-vulkan-rs
 
-Rust wrapper for [realcugan-ncnn-vulkan](https://github.com/MEGAMENE/realcugan-ncnn-vulkan), an anime-style image super-resolution and restoration engine based on Real-CUGAN and Tencent's NCNN Vulkan framework.
+Rust bindings for [realcugan-ncnn-vulkan](https://github.com/MEGAMENE/realcugan-ncnn-vulkan), an anime-style image super-resolution and denoising engine built on Real-CUGAN and Tencent's NCNN Vulkan framework.
 
 ## Features
 
-- **Continuous Safe VRAM Sizing**: Dynamically computes optimal tile dimensions based on device heap budget, scaling ratio, and GPU architecture (integrated vs. discrete).
-- **Single-Tile Bypass**: Skips tiling overhead and sync-gap overhead entirely when images fit within safe VRAM limits.
-- **Dynamic OOM Recovery**: Automatically catches GPU command buffer memory exhaustion and halves tile sizes on the fly down to 32.
-- **Multi-Level TTA (Test-Time Augmentation)**: Supports 1x (off), 2x, 4x, and 8x augmentation levels for higher quality reconstruction.
-- **FP16 Arithmetic Support**: Configurable FP16 execution flags for Intel and AMD GPUs.
-- **Persistent Pipeline Caching**: Reusable per-GPU Vulkan pipeline caches saved to platform cache folders (`pipeline_gpu<gpuid>.bin`) to minimize startup latency.
-- **RGB and RGBA Alpha Channel Preservation**: Full support for transparency and depth normalization.
-- **CPU and GPU Execution**: Automatic CPU routing for `gpuid = -1` or explicit CPU inference via `proc_image_cpu`.
+- **1:1 Layer 1 `RealCUGANConfig` Alignment**: Strongly typed Rust configuration (`RealCuganConfig`, `RealCuganScale`, `RealCuganNoise`, `RealCuganSyncGap`, `RealCuganTtaLevel`, `RealCuganModelType`) with strict upfront `(model, scale, noise)` matrix validation.
+- **Native Dynamic VRAM Auto-Tiling**: Passing `tile_size = 0` delegates continuous VRAM budget sizing, `concurrent_jobs` scaling, single-tile bypass, and OOM tile-halving recovery directly to Layer 1.
+- **Accurate `models-pro` 2x/3x Affine Scaling**: Automatically forwards `is_pro_model` for 2x and 3x `models-pro` models (`0.7 / 0.15` normalization) and overrides Windows BGR defaults for Rust RGB/RGBA images.
+- **Multi-Level TTA & FP16 Arithmetic**: Supports `X1`, `X2`, `X4`, and `X8` test-time augmentation levels and configurable FP16 shader arithmetic.
+- **Persistent Per-GPU Pipeline Caching**: Reuses NCNN's per-device `VkPipelineCache` files (`pipeline_gpu<id>_<vendor>_<device>_v3.bin`) across runs.
+- **Thread-Safe (`Send + Sync`)**: Share a single `Arc<RealCugan>` across worker threads for concurrent inference on GPU or CPU.
+- **Zero-Copy 8-Bit Input & Alpha Preservation**: Borrows `Rgb8`/`Rgba8` inputs zero-copy, expands `L8`/`La8` fallibly, converts 16-bit and `Rgb32F`/`Rgba32F` inputs to 8-bit `Rgb8`/`Rgba8` while preserving alpha channels via bicubic upscaling.
+- **Self-Contained In-Tree Static Build**: Builds the pinned NCNN (`20261020`) submodule statically with a minimal 20-layer Real-CUGAN allowlist and NCNN's dynamic `simplevk` Vulkan loader — no external NCNN SDK or Vulkan SDK installation required.
 
 ## Building
 
 ### Prerequisites
 
+- Rust 1.88+ (Edition 2021)
 - CMake 3.20+
 - C++17 compatible compiler (MSVC on Windows, GCC/Clang on Linux/macOS)
-- Vulkan runtime driver (NCNN uses a dynamic in-house loader; no separate Vulkan SDK installation is required)
+- Vulkan runtime driver for GPU inference (loaded dynamically at runtime; CPU inference via `gpuid = -1` works without Vulkan)
 
-### Setup
+### Build & Test
 
-1. Initialize submodules:
+1. Initialize submodules recursively:
    ```bash
    git submodule update --init --recursive
    ```
 
-2. Build the crate:
+2. Build and run tests:
    ```bash
-   cargo build --release
+   cargo test --release
    ```
 
-*(Optional)* To link against an existing system NCNN installation instead of building in-tree, point `NCNN_DIR` to the directory containing `ncnnConfig.cmake`:
-```bash
-NCNN_DIR=/path/to/ncnn/lib/cmake/ncnn cargo build --release
-```
+*(Optional)* Set `REALCUGAN_NATIVE=1` to optimize C++ wrapper compilation for the host CPU instruction set (`/arch:AVX2` on MSVC x64, `-march=native` on GCC/Clang).
 
 ## Usage
 
-### Basic Inference
+### Basic GPU Inference
 
 ```rust
+use std::num::NonZeroU32;
 use image::open;
-use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganModelType};
+use realcugan_ncnn_vulkan_rs::{
+    RealCugan, RealCuganConfig, RealCuganModelType, RealCuganNoise, RealCuganScale,
+    RealCuganSyncGap, RealCuganTtaLevel,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let img = open("input.png")?;
 
-    // Initialize 2x upscaler with auto-calculated VRAM tile size and default SE model
-    let cugan = RealCugan::new(
-        0,                        // gpuid (0 for first GPU, -1 for CPU)
-        -1,                       // noise level (-1: conservative, 0: no-denoise, 1-3: denoise level)
-        2,                        // scale (2, 3, or 4)
-        RealCuganModelType::Se,   // model type: Nose, Pro, or Se
-        0,                        // tile_size (0 = auto continuous safe VRAM sizing)
-        3,                        // sync_gap (0, 1, 2, or 3)
-        false,                    // tta_mode (legacy bool: false = 1x, true = 8x)
-        1,                        // num_threads (processing threads)
-        "path/to/models".into(),  // path to models directory
-    )?;
+    let mut cfg = RealCuganConfig::new("path/to/models");
+    cfg.gpuid = 0; // 0 = first Vulkan GPU, -1 = CPU
+    cfg.model = RealCuganModelType::Pro;
+    cfg.scale = RealCuganScale::X2;
+    cfg.noise = RealCuganNoise::Conservative;
+    cfg.tile_size = 0; // 0 = automatic Layer 1 VRAM sizing
+    cfg.sync_gap = RealCuganSyncGap::VeryRough;
+    cfg.tta_level = RealCuganTtaLevel::X4;
+    cfg.concurrent_jobs = NonZeroU32::new(1).unwrap();
+    cfg.use_fp16_arithmetic = false;
 
+    let cugan = RealCugan::new(cfg)?;
     let output = cugan.proc_image(&img)?;
     output.save("output.png")?;
     Ok(())
 }
 ```
 
-### Advanced Options: TTA Levels & FP16 Arithmetic
+### CPU Inference
 
-Use `new_with_options` to specify granular TTA levels (1, 2, 4, 8) and enable FP16 arithmetic:
-
-```rust
-use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganModelType};
-
-let cugan = RealCugan::new_with_options(
-    0,                        // gpuid (0 = GPU 0)
-    -1,                       // noise level
-    2,                        // scale (2x)
-    RealCuganModelType::Pro,  // model architecture
-    0,                        // auto tile size
-    3,                        // sync gap mode
-    4,                        // tta_level (1, 2, 4, or 8)
-    true,                     // use_fp16_arithmetic
-    1,                        // num_threads
-    "models".into(),          // models directory
-)?;
-
-let result = cugan.proc_image(&image)?;
-```
-
-### Explicit CPU Processing
+Set `cfg.gpuid = -1` (and leave `cfg.num_threads = None` to automatically use all available CPU cores, or specify `Some(NonZeroU32::new(n).unwrap())`):
 
 ```rust
-let cpu_cugan = RealCugan::new_with_options(
-    -1, // gpuid = -1 triggers CPU engine
-    -1,
-    2,
-    RealCuganModelType::Se,
-    400,
-    3,
-    1,
-    false,
-    2,
-    "models".into(),
-)?;
+use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganConfig};
 
-let result = cpu_cugan.proc_image_cpu(&image)?;
+let mut cfg = RealCuganConfig::new("path/to/models");
+cfg.gpuid = -1;
+let cugan = RealCugan::new(cfg)?;
+let output = cugan.proc_image(&img)?;
 ```
+
+### Concurrent Multi-Threaded Inference (`Send + Sync`)
+
+`RealCugan` is both `Send` and `Sync` and can be shared via `Arc<RealCugan>`:
+
+```rust
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganConfig};
+
+let mut cfg = RealCuganConfig::new("path/to/models");
+cfg.concurrent_jobs = NonZeroU32::new(4).unwrap();
+let cugan = Arc::new(RealCugan::new(cfg)?);
+```
+
+> **Lifetime Note**: NCNN registers `atexit(ncnn::destroy_gpu_instance)` when a Vulkan GPU instance is initialized. Avoid storing GPU-backed `RealCugan` instances inside `thread_local!` destructors or exit handlers that execute after `atexit`, and join worker threads before `main` exits.
+
+## Supported Model Matrix
+
+| Model (`RealCuganModelType`) | Scales (`RealCuganScale`) | Noise Levels (`RealCuganNoise`) |
+|---|---|---|
+| `Se` | `X2` | `Conservative`, `NoDenoise`, `Denoise1x`, `Denoise2x`, `Denoise3x` |
+| `Se` | `X3`, `X4` | `Conservative`, `NoDenoise`, `Denoise3x` |
+| `Pro` | `X2`, `X3` | `Conservative`, `NoDenoise`, `Denoise3x` |
+| `Nose` | `X2` | `NoDenoise` |
 
 ## License
 

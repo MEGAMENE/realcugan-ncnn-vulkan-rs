@@ -1,6 +1,5 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
 
 use cmake::Config;
 
@@ -9,81 +8,92 @@ fn main() {
     println!("cargo:rerun-if-changed=src/CMakeLists.txt");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan.cpp");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan.h");
+    println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/generate_shader_comp_header.cmake");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan_preproc.comp");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan_preproc_tta.comp");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan_postproc.comp");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan_postproc_tta.comp");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan_4x_postproc.comp");
     println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/realcugan_4x_postproc_tta.comp");
-    println!("cargo:rerun-if-env-changed=KURP_HEADLESS_TEST");
-    println!("cargo:rerun-if-env-changed=NCNN_DIR");
-    println!("cargo:rustc-check-cfg=cfg(headless_stub)");
+    println!("cargo:rerun-if-changed=src/realcugan-ncnn-vulkan/src/ncnn/CMakeLists.txt");
+    println!("cargo:rerun-if-env-changed=REALCUGAN_NATIVE");
 
-    if env::var("KURP_HEADLESS_TEST").as_deref() == Ok("1") {
-        println!("cargo:rustc-cfg=headless_stub");
-        return;
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let crt_static = target_features.split(',').any(|feat| feat == "crt-static");
+
+    let mut config = Config::new("src");
+    config.profile("Release");
+
+    if target_env == "msvc" {
+        // Disable MSBuild file tracker via environment property to avoid MAX_PATH FTK1011 errors
+        // without passing MSBuild-only CLI arguments that break Ninja/Make generators.
+        config.env("TrackFileAccess", "false");
+        let msvc_rt = if crt_static {
+            "MultiThreaded"
+        } else {
+            "MultiThreadedDLL"
+        };
+        config.define("CMAKE_MSVC_RUNTIME_LIBRARY", msvc_rt);
     }
 
-    // Disable MSBuild file tracker to avoid MAX_PATH failure on Windows deep build paths
-    std::env::set_var("TrackFileAccess", "false");
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-    let ncnn_dir = env::var("NCNN_DIR")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            let candidate = PathBuf::from(
-                r"C:\Users\Courier\Documents\Antigravity Projects\Kurp Matrix Workbench\ncnn\ncnn-20260526-windows-vs2022-shared\x64\lib\cmake\ncnn",
-            );
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        });
-
-    let realcugan = {
-        let mut config = Config::new("src/");
-        config.profile("Release");
-        if let Some(ref dir) = ncnn_dir {
-            config.define("ncnn_DIR", dir);
-            config.define("USE_SYSTEM_NCNN", "ON");
-        }
-        config.build_arg("/p:TrackFileAccess=false");
-        config.build()
-    };
-
-    println!("cargo:rustc-link-search=native={}", realcugan.join("lib").display());
-    println!("cargo:rustc-link-lib=static:-bundle={}", "realcugan-ncnn-vulkan-wrapper");
-
-    if let Some(ref dir) = ncnn_dir {
-        // .../lib/cmake/ncnn -> .../lib -> .../bin
-        if let Some(cmake_dir) = dir.parent() {
-            if let Some(lib_dir) = cmake_dir.parent() {
-                println!("cargo:rustc-link-search=native={}", lib_dir.display());
-                if let Some(root_dir) = lib_dir.parent() {
-                    let bin_dir = root_dir.join("bin");
-                    if bin_dir.exists() {
-                        println!("cargo:rustc-link-search=native={}", bin_dir.display());
-                        let ncnn_dll = bin_dir.join("ncnn.dll");
-                        if ncnn_dll.exists() {
-                            let _ = fs::copy(&ncnn_dll, out_dir.join("ncnn.dll"));
-                            // Copy to target directory hierarchy so cargo test / run find ncnn.dll
-                            if let Some(target_dir) = out_dir.ancestors().nth(3) {
-                                let _ = fs::copy(&ncnn_dll, target_dir.join("ncnn.dll"));
-                                let _ = fs::copy(&ncnn_dll, target_dir.join("deps").join("ncnn.dll"));
-                                let _ = fs::copy(&ncnn_dll, target_dir.join("examples").join("ncnn.dll"));
-                            }
-                        }
-                    }
-                }
-            }
+    if let Ok(native) = env::var("REALCUGAN_NATIVE") {
+        if matches!(native.as_str(), "1" | "ON" | "on" | "TRUE" | "true") {
+            config.define("REALCUGAN_NATIVE", "ON");
         }
     }
 
-    println!("cargo:rustc-link-lib=dylib=ncnn");
-    if cfg!(unix) {
-        println!("cargo:rustc-link-lib=dylib={}", "stdc++");
+    let dst = config.build();
+
+    let manifest_path = dst.join("link_manifest.txt");
+    let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read CMake link manifest at {}: {}",
+            manifest_path.display(),
+            err
+        )
+    });
+
+    for line in manifest.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some((key, val)) = line.split_once('=') else {
+            panic!("malformed link_manifest.txt entry: {line}");
+        };
+        match key {
+            "LIB_SUBDIR" => {
+                println!("cargo:rustc-link-search=native={}", dst.join(val).display());
+            }
+            "SEARCH_DIR" => {
+                println!("cargo:rustc-link-search=native={val}");
+            }
+            "STATIC_LIB" => {
+                println!("cargo:rustc-link-lib=static={val}");
+            }
+            "DYLIB" => {
+                println!("cargo:rustc-link-lib=dylib={val}");
+            }
+            "FRAMEWORK" => {
+                println!("cargo:rustc-link-lib=framework={val}");
+            }
+            "LINK_ARG" => {
+                println!("cargo:rustc-link-arg={val}");
+            }
+            other => {
+                panic!("unknown link_manifest.txt key: {other}");
+            }
+        }
+    }
+
+    match target_os.as_str() {
+        "macos" | "ios" | "freebsd" | "openbsd" => {
+            println!("cargo:rustc-link-lib=dylib=c++");
+        }
+        "linux" | "android" => {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+        }
+        "windows" if target_env == "gnu" => {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+        }
+        _ => {}
     }
 }
